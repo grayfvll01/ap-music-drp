@@ -1,0 +1,5 @@
+# The exe links no C runtime (see src/rt.rs and build.rs), so it needs no
+# VCRUNTIME140.dll or redistributable.
+# windows_slim_errors: errors are bare HRESULTs (no oleaut32, smaller).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["--cfg", "windows_slim_errors"]
