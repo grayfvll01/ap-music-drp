@@ -135,13 +135,21 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
         return None;
     }
     let links = c.links && meta.is_some();
-    let mut f = format!(r#""type":{},"status_display_type":{}"#, c.activity_type, c.status_display);
+    // "Song — Artist": both on the member-list line, the album on the second.
+    let both = c.status_display == crate::config::SONG_ARTIST;
+    let (details_tpl, state_tpl) = match both {
+        true if t.artist.is_empty() => ("{title}", "{album}"),
+        true => ("{title} \u{2014} {artist}", "{album}"),
+        false => (c.details.as_str(), c.state.as_str()),
+    };
+    let display = if both { 2 } else { c.status_display };
+    let mut f = format!(r#""type":{},"status_display_type":{display}"#, c.activity_type);
     if let Some(name) = fit(&c.name) {
         member(&mut f, "name", &name);
     }
 
-    let details = fit(&render(&c.details, t));
-    let state = fit(&render(&c.state, t));
+    let details = fit(&render(details_tpl, t));
+    let state = fit(&render(state_tpl, t));
     if details.is_none() && state.is_none() {
         return None;
     }
@@ -153,8 +161,11 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
     }
     if let Some(s) = &state {
         member(&mut f, "state", s);
-        if links && url_ok(&meta.unwrap().artist_url) {
-            member(&mut f, "state_url", &meta.unwrap().artist_url);
+        if let Some(m) = meta.filter(|_| links) {
+            let url = if both { &m.album_url } else { &m.artist_url };
+            if url_ok(url) {
+                member(&mut f, "state_url", url);
+            }
         }
     }
 
@@ -265,6 +276,17 @@ mod tests {
             c.status_display = i as u8;
             assert_eq!(get(&c, &t).num("status_display_type"), Some(want));
         }
+        let mut c = d.clone();
+        c.status_display = crate::config::SONG_ARTIST;
+        let v = get(&c, &t);
+        assert_eq!(v.num("status_display_type"), Some(2));
+        assert_eq!(v.str("details"), Some("GIMME A HUG \u{2014} Drake"));
+        assert_eq!(v.str("state"), Some("$ome $exy $ongs 4 U"));
+        assert_eq!(v.str("state_url"), Some(meta().album_url.as_str()));
+        let mut solo = track(State::Playing);
+        solo.artist.clear();
+        assert_eq!(get(&c, &solo).str("details"), Some("GIMME A HUG"));
+
         let paused = track(State::Paused);
         assert!(build(&paused, None, &d, 0).is_none(), "paused hidden by default");
         let mut c = d.clone();

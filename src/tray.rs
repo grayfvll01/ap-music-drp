@@ -32,7 +32,7 @@ const ID_RESET: usize = 16;
 const ID_ABOUT: usize = 17;
 /// On/off switches, one per `config.ini` key (see `switches`).
 const ID_SWITCH: usize = 20;
-/// Status text choices, in `status_display` order (name, state, details).
+/// Status text choices, in `status_display` order (name, state, details, song — artist).
 const ID_STATUS: usize = 40;
 
 /// The on/off settings in the menu: (config key, current value).
@@ -57,8 +57,13 @@ const SWITCH_TEXT: [PCWSTR; 7] = [
     w!("\"song.link\" (any streaming service)"),
     w!("Check for updates automatically"),
 ];
-const STATUS_TEXT: [PCWSTR; 3] =
-    [w!("Listening to Apple Music"), w!("Listening to <artist>"), w!("Listening to <song>")];
+const STATUS_TEXT: [PCWSTR; 4] = [
+    w!("Listening to Apple Music"),
+    w!("Listening to <artist>"),
+    w!("Listening to <song>"),
+    w!("Listening to <song> \u{2014} <artist>"),
+];
+const STATUS_VALUE: [&str; 4] = ["name", "state", "details", "song_artist"];
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ICON: AtomicIsize = AtomicIsize::new(0);
@@ -340,8 +345,8 @@ fn command(hwnd: HWND, id: usize) {
             config::reset();
             false
         }
-        _ if (ID_STATUS..ID_STATUS + 3).contains(&id) => {
-            config::set("status_display", ["name", "state", "details"][id - ID_STATUS]);
+        _ if (ID_STATUS..ID_STATUS + STATUS_VALUE.len()).contains(&id) => {
+            config::set("status_display", STATUS_VALUE[id - ID_STATUS]);
             false
         }
         _ if (ID_SWITCH..ID_SWITCH + 7).contains(&id) => {
@@ -507,13 +512,14 @@ mod tests {
         assert_eq!(SWITCH_TEXT.len(), switches(&base).len());
     }
 
-    /// The three status choices map to the right `status_display` values.
+    /// Each status choice maps to its `status_display` value (the menu's
+    /// check mark is `status_display == index`).
     #[test]
     fn status_choices() {
-        for (i, v) in ["name", "state", "details"].into_iter().enumerate() {
+        for (i, v) in STATUS_VALUE.into_iter().enumerate() {
             let c = parse_into(Config::default(), &with_value(DEFAULT_FILE, "status_display", v));
-            assert_eq!(c.status_display as usize, i);
+            assert_eq!(c.status_display as usize, i, "{v}");
         }
-        assert_eq!(STATUS_TEXT.len(), 3);
+        assert_eq!(STATUS_TEXT.len(), STATUS_VALUE.len());
     }
 }

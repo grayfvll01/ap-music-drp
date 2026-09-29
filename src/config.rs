@@ -6,6 +6,10 @@ use crate::sys;
 
 pub const DEFAULT_FILE: &str = include_str!("../config.default.ini");
 
+/// `status_display` choice that shows "<song> — <artist>" (not a Discord
+/// value: presence.rs turns it into details = song — artist, state = album).
+pub const SONG_ARTIST: u8 = 3;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub client_id: String,
@@ -116,6 +120,7 @@ pub fn parse_into(mut c: Config, text: &str) -> Config {
                     "name" | "app" => 0,
                     "state" | "artist" => 1,
                     "details" | "title" => 2,
+                    "song_artist" | "both" => SONG_ARTIST,
                     _ => c.status_display,
                 }
             }
