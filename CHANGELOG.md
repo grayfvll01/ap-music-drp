@@ -2,6 +2,10 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.0.4 - 2026-09-29
+
+- The installer keeps a log in %TEMP% to help troubleshoot updates.
+
 ## 1.0.3 - 2026-09-29
 
 - Singles no longer show the song name two or three times (their "album" is just the song's name).

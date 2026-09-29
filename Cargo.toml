@@ -1,6 +1,6 @@
 [package]
 name = "apple-music-discord-presence"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Show what you're playing in Apple Music on your Discord profile (Windows tray app)"
