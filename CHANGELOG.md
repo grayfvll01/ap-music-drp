@@ -2,6 +2,10 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.0.1 - 2026-09-28
+
+- New status text choice: "Listening to <song> — <artist>".
+
 ## 1.0.0 - 2026-09-27
 
 First public release.
