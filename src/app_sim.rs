@@ -378,5 +378,21 @@ fn worker_scenarios() {
     run(&mut w, &h, 3000);
     assert_eq!(showing().as_deref(), Some("A"), "show_paused = true");
 
+    // A new song replaces the old one directly: the status never blinks off
+    // in between, even while its (slow) album-art lookup runs.
+    let (mut w, mut h) = reset(true, 850);
+    h.play("First");
+    run(&mut w, &h, 4000);
+    assert_eq!(showing().as_deref(), Some("First"));
+    h.play("Second");
+    let end = clock() + 5000;
+    while clock() < end {
+        let sleep = w.tick() as i64;
+        h.check();
+        assert!(showing().is_some(), "the status blinked off between songs");
+        advance(sleep);
+    }
+    assert_eq!(showing().as_deref(), Some("Second"));
+
     SHARED.enabled.store(true, SeqCst);
 }

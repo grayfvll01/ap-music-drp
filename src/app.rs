@@ -384,12 +384,12 @@ impl Worker {
                 if self.dc.is_some() {
                     let (size, lookup) = (self.cfg.artwork_size, wants_lookup(&self.cfg));
                     if lookup && !self.lookup.cached(&t, &self.country, size) {
-                        // A lookup can take seconds: take down whatever is up
-                        // first, then look at Apple Music (and the toggle)
-                        // again before publishing from the now-cached result.
-                        if self.shown.is_some() {
-                            self.sync(None, mono);
-                        }
+                        // A lookup can take seconds: put the new song up
+                        // straight away (replacing the old one, without art
+                        // or links), then look it up. The next poll re-checks
+                        // Apple Music and the toggle, and adds the art.
+                        let now_playing = presence::build(&t, None, &self.cfg, now);
+                        self.sync(now_playing, mono);
                         self.lookup.find(&t, &self.country, size);
                         return 0;
                     }
