@@ -37,6 +37,8 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 ; Close a running copy (it clears its Discord status on the way out).
 CloseApplications=force
+; Leave a log in %TEMP% ("Setup Log <date>.txt") for troubleshooting updates.
+SetupLogging=yes
 RestartApplications=no
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName={#AppName}
