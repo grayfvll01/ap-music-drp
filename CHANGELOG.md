@@ -2,6 +2,12 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.0.3 - 2026-09-29
+
+- Singles no longer show the song name two or three times (their "album" is just the song's name).
+- "Song — Artist": a featured-artist credit moves from the title to the second line, so the artist stays visible.
+- A line that repeats another line is never shown.
+
 ## 1.0.2 - 2026-09-28
 
 - Uses this project's own "Apple Music" Discord app. Existing settings switch over automatically.
