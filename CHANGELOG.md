@@ -2,6 +2,10 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.0.5 - 2026-09-29
+
+- Changing songs now replaces the status straight away instead of briefly clearing it. The album art follows a moment later.
+
 ## 1.0.4 - 2026-09-29
 
 - The installer keeps a log in %TEMP% to help troubleshoot updates.
