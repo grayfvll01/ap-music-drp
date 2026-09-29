@@ -2,6 +2,10 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.0.2 - 2026-09-28
+
+- Uses this project's own "Apple Music" Discord app. Existing settings switch over automatically.
+
 ## 1.0.1 - 2026-09-28
 
 - New status text choice: "Listening to <song> — <artist>".
