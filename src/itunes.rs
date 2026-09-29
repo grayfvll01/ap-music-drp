@@ -198,7 +198,7 @@ fn is_separator(c: char) -> bool {
 }
 
 /// Lowercase, keep letters/digits, turn everything else into single spaces.
-fn norm(s: &str) -> String {
+pub(crate) fn norm(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c == '\'' || c == '\u{2019}' {

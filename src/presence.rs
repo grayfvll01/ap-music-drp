@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::itunes::Meta;
+use crate::itunes::norm;
 use crate::json::push_str;
 use crate::prelude::*;
 use crate::smtc::{State, Track};
@@ -61,6 +62,40 @@ pub fn album_display(album: &str) -> &str {
     album
 }
 
+/// "Song (feat. X) [Remix]" -> ("Song [Remix]", "X"): takes a featured-artist
+/// credit ("feat.", "ft.", "featuring", "with" in brackets) out of a title.
+pub fn split_feat(title: &str) -> (String, String) {
+    let mut from = 0;
+    while let Some(i) = title[from..].find(['(', '[']).map(|i| i + from) {
+        let close = if title.as_bytes()[i] == b'(' { ')' } else { ']' };
+        let Some(len) = title[i..].find(close) else { break };
+        let inner = title[i + 1..i + len].trim();
+        let lower = inner.to_ascii_lowercase(); // same byte offsets as `inner`
+        for key in ["feat. ", "feat ", "ft. ", "ft ", "featuring ", "with "] {
+            if lower.starts_with(key) {
+                let rest = format!("{} {}", &title[..i], &title[i + len + 1..]);
+                let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+                return (rest, inner[key.len()..].trim().to_string());
+            }
+        }
+        from = i + len + 1;
+    }
+    (title.to_string(), String::new())
+}
+
+/// The album worth showing: none when it's just the song's own name, as it
+/// is for singles ("Song - Single").
+fn album_for(t: &Track) -> &str {
+    let album = album_display(&t.album);
+    let a = norm(album);
+    if a.is_empty() || a == norm(&t.title) || a == norm(&split_feat(&t.title).0) { "" } else { album }
+}
+
+/// Same text, ignoring case and punctuation.
+fn same(a: &Option<String>, b: &Option<String>) -> bool {
+    matches!((a, b), (Some(x), Some(y)) if norm(x) == norm(y))
+}
+
 /// Fills `{title}`, `{artist}`, `{album}` (in one pass, so a song title
 /// containing "{artist}" stays literal) and tidies whitespace.
 pub fn render(tpl: &str, t: &Track) -> String {
@@ -74,7 +109,7 @@ pub fn render(tpl: &str, t: &Track) -> String {
         } else if rest.starts_with("{artist}") {
             (t.artist.as_str(), 8)
         } else if rest.starts_with("{album}") {
-            (album_display(&t.album), 7)
+            (album_for(t), 7)
         } else {
             ("{", 1)
         };
@@ -135,12 +170,24 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
         return None;
     }
     let links = c.links && meta.is_some();
-    // "Song — Artist": both on the member-list line, the album on the second.
+    // "Song — Artist" on the member-list line. The featured-artist credit
+    // moves out of the title (it would push the artist out of view) onto the
+    // second line; otherwise that line is the album.
     let both = c.status_display == crate::config::SONG_ARTIST;
-    let (details_tpl, state_tpl) = match both {
-        true if t.artist.is_empty() => ("{title}", "{album}"),
-        true => ("{title} \u{2014} {artist}", "{album}"),
-        false => (c.details.as_str(), c.state.as_str()),
+    let (short, feat) = split_feat(&t.title);
+    let (details_text, state_text) = if both {
+        let d = if t.artist.is_empty() { short } else { format!("{short} \u{2014} {}", t.artist) };
+        let s = if !feat.is_empty() { format!("feat. {feat}") } else { album_for(t).to_string() };
+        (d, s)
+    } else {
+        (render(&c.details, t), render(&c.state, t))
+    };
+    // Where the second line links: the artist, or in "Song — Artist" the
+    // album (a featured-artist credit has no link).
+    let state_link = match (both, feat.is_empty()) {
+        (false, _) => meta.map(|m| m.artist_url.as_str()),
+        (true, true) => meta.map(|m| m.album_url.as_str()),
+        (true, false) => None,
     };
     let display = if both { 2 } else { c.status_display };
     let mut f = format!(r#""type":{},"status_display_type":{display}"#, c.activity_type);
@@ -148,8 +195,16 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
         member(&mut f, "name", &name);
     }
 
-    let details = fit(&render(details_tpl, t));
-    let state = fit(&render(state_tpl, t));
+    // Never show the same text twice.
+    let details = fit(&details_text);
+    let mut state = fit(&state_text);
+    if same(&state, &details) {
+        state = None;
+    }
+    let mut large_text = fit(&render(&c.large_text, t));
+    if same(&large_text, &details) || same(&large_text, &state) {
+        large_text = None;
+    }
     if details.is_none() && state.is_none() {
         return None;
     }
@@ -161,11 +216,8 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
     }
     if let Some(s) = &state {
         member(&mut f, "state", s);
-        if let Some(m) = meta.filter(|_| links) {
-            let url = if both { &m.album_url } else { &m.artist_url };
-            if url_ok(url) {
-                member(&mut f, "state_url", url);
-            }
+        if let Some(url) = state_link.filter(|u| links && url_ok(u)) {
+            member(&mut f, "state_url", url);
         }
     }
 
@@ -174,7 +226,6 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
         _ if url_ok(&c.fallback_image) => c.fallback_image.as_str(),
         _ => "",
     };
-    let large_text = fit(&render(&c.large_text, t));
     if !image.is_empty() {
         f.push_str(r#","assets":{"#);
         member(&mut f, "large_image", image);
@@ -292,6 +343,57 @@ mod tests {
         let mut c = d.clone();
         c.show_paused = true;
         assert!(get(&c, &paused).get("timestamps").is_none(), "paused: shown without a time bar");
+    }
+
+    #[test]
+    fn featured_artists() {
+        assert_eq!(
+            split_feat("Nena Maldici\u{f3}n (feat. Lenny Tav\u{e1}rez)"),
+            ("Nena Maldici\u{f3}n".into(), "Lenny Tav\u{e1}rez".into())
+        );
+        assert_eq!(split_feat("Song [ft. A & B] (Remix)"), ("Song (Remix)".into(), "A & B".into()));
+        assert_eq!(split_feat("Song (Live)"), ("Song (Live)".into(), String::new()));
+        assert_eq!(split_feat("Unclosed (feat. X"), ("Unclosed (feat. X".into(), String::new()));
+    }
+
+    /// A single whose album is the song's own name, with a featured artist.
+    #[test]
+    fn singles_never_repeat() {
+        let t = Track {
+            title: "Nena Maldici\u{f3}n (feat. Lenny Tav\u{e1}rez)".into(),
+            artist: "Paulo Londra".into(),
+            album: "Nena Maldici\u{f3}n (feat. Lenny Tav\u{e1}rez) - Single".into(),
+            state: State::Playing,
+            duration_ms: 228_000,
+            position_ms: 0,
+        };
+        let mut c = Config::default();
+        c.status_display = crate::config::SONG_ARTIST;
+        let v = json::parse(&build(&t, Some(&meta()), &c, 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("details"), Some("Nena Maldici\u{f3}n \u{2014} Paulo Londra"));
+        assert_eq!(v.str("state"), Some("feat. Lenny Tav\u{e1}rez"));
+        assert!(v.str("state_url").is_none());
+        assert!(v.get("assets").unwrap().str("large_text").is_none(), "no album line for a single");
+
+        // Default layout: song, artist, and no album line either.
+        let v = json::parse(&build(&t, None, &Config::default(), 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("state"), Some("Paulo Londra"));
+        assert!(v.get("assets").unwrap().str("large_text").is_none());
+
+        // Song — Artist with a real album and a featured artist: three lines.
+        let mut t2 = t.clone();
+        t2.album = "Homerun".into();
+        let v = json::parse(&build(&t2, Some(&meta()), &c, 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("state"), Some("feat. Lenny Tav\u{e1}rez"));
+        assert_eq!(v.get("assets").unwrap().str("large_text"), Some("Homerun"));
+        // ...and without a featured artist the album is line 2, not repeated on line 3.
+        let mut t3 = t2.clone();
+        t3.title = "Party".into();
+        let v = json::parse(&build(&t3, Some(&meta()), &c, 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("details"), Some("Party \u{2014} Paulo Londra"));
+        assert_eq!(v.str("state"), Some("Homerun"));
+        assert_eq!(v.str("state_url"), Some(meta().album_url.as_str()));
+        assert!(v.get("assets").unwrap().str("large_text").is_none());
     }
 
     #[test]
