@@ -195,6 +195,18 @@ pub fn set(key: &str, value: &str) -> bool {
     sys::write_file(&tmp, with_value(&text, key, value).as_bytes()) && sys::replace(&tmp, &path())
 }
 
+/// The public "Apple Music" Discord app that versions before 1.0.2 used.
+const OLD_CLIENT_ID: &str = "773825528921849856";
+
+/// Moves settings files written by older versions to the current defaults
+/// where they only held the old default (currently: the Discord app).
+pub fn migrate() {
+    let Some(text) = read_text() else { return };
+    if parse_into(Config::base(), &text).client_id == OLD_CLIENT_ID {
+        set("client_id", &Config::default().client_id);
+    }
+}
+
 /// Back to the shipped defaults.
 pub fn reset() {
     sys::delete_file(&path());
@@ -288,6 +300,15 @@ mod tests {
         let c = parse_into(Config::default(), &added);
         assert!(!c.artwork && c.show_paused);
         assert_eq!(c.state, "{artist}");
+    }
+
+    #[test]
+    fn old_default_app_is_replaced() {
+        let old = format!("# x\r\nclient_id = {OLD_CLIENT_ID}\r\nlinks = false\r\n");
+        let new = with_value(&old, "client_id", &Config::default().client_id);
+        let c = parse_into(Config::default(), &new);
+        assert_eq!(c.client_id, "1554292539270500395");
+        assert!(!c.links, "other settings untouched");
     }
 
     #[test]

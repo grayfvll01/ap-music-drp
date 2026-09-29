@@ -118,6 +118,7 @@ unsafe fn run_tray() {
         update::init();
         autostart::migrate();
         let first_run = config::ensure_file();
+        config::migrate();
         let _ = tray(NIM_ADD);
         if first_run {
             balloon("Your Apple Music songs now show on Discord.\nClick the music note here for options.");
