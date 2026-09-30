@@ -2,6 +2,12 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Each version's section here becomes its release notes.
 
+## 1.1.0 - 2026-09-29
+
+- Spotify support, with the same options as Apple Music. Friends who click the song, artist or album open it on Spotify.
+- New **Music apps** menu to choose between Apple Music and Spotify. If both are playing, the song already on your status stays.
+- Skipping a few songs in a row no longer makes the status disappear for a while when their album art arrives.
+
 ## 1.0.5 - 2026-09-29
 
 - Changing songs now replaces the status straight away instead of briefly clearing it. The album art follows a moment later.
