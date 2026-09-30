@@ -28,13 +28,13 @@ function ClickExpect($id, $what, [scriptblock]$test) {
     "  FAIL $what"; $script:fail++
 }
 $fail = 0
-if ((Sets).Count -eq 0) { throw 'nothing sent to Discord yet (is Apple Music playing?)' }
+if ((Sets).Count -eq 0) { throw 'nothing sent to Discord yet (is Apple Music or Spotify playing?)' }
 
 $cases = @(
     @{ id = 20; key = 'artwork';         a = { param($l) $l -match 'Purple211' };             b = { param($l) $l -match 'large_image' -and $l -notmatch 'Purple211' } },
     @{ id = 21; key = 'show_progress';   a = { param($l) $l -notmatch 'timestamps' };         b = { param($l) $l -match 'timestamps' } },
     @{ id = 23; key = 'links';           a = { param($l) $l -notmatch 'details_url' };        b = { param($l) $l -match 'details_url' } },
-    @{ id = 24; key = 'button_listen';   a = { param($l) $l -match 'Listen on Apple Music' }; b = { param($l) $l -notmatch 'buttons' } },
+    @{ id = 24; key = 'button_listen';   a = { param($l) $l -match 'Listen on (Apple Music|Spotify)' }; b = { param($l) $l -notmatch 'buttons' } },
     @{ id = 25; key = 'button_songlink'; a = { param($l) $l -match 'song\.link/i/' };         b = { param($l) $l -notmatch 'buttons' } }
 )
 foreach ($c in $cases) {

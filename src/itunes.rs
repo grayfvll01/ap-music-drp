@@ -1,5 +1,5 @@
 //! Album art + Apple Music links via the public iTunes Search API.
-//! Only the Apple Music track's own title/artist/album are ever sent.
+//! Only the playing track's own title/artist/album are ever sent.
 
 use crate::http::{self, Client};
 use crate::json::{self, Json};
@@ -213,8 +213,9 @@ pub(crate) fn norm(s: &str) -> String {
 }
 
 /// Drops decorations that don't make it a different recording: "(feat. X)",
-/// "[with Y]", "(2011 Remaster)" and " - Single"/" - EP". Tags like "(Live)",
-/// "(Remix)" or "(Instrumental)" stay, since those are different songs.
+/// "[with Y]", "(2011 Remaster)", Spotify's " - Remastered 2011" and
+/// " - Single"/" - EP". Tags like "(Live)", "(Remix)" or "(Instrumental)"
+/// stay, since those are different songs.
 fn loose(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -235,6 +236,11 @@ fn loose(s: &str) -> String {
     let mut out = out.trim();
     for suffix in [" - Single", " - EP"] {
         out = out.strip_suffix(suffix).unwrap_or(out).trim_end();
+    }
+    if let Some((base, tag)) = out.split_once(" - ")
+        && norm(tag).contains("remaster")
+    {
+        out = base.trim_end();
     }
     norm(out)
 }
@@ -333,7 +339,7 @@ fn album_id(v: &Json, t: &Track) -> Option<u64> {
 
 /// "ROA & CDobleta" / "ROA, Omar Courtz & Bryant Myers" -> "ROA". (Band names
 /// like "Tyler, The Creator" are handled by also accepting the full name.)
-fn main_artist(artist: &str) -> &str {
+pub(crate) fn main_artist(artist: &str) -> &str {
     let end = [" & ", ", ", " x ", " feat. "].iter().filter_map(|sep| artist.find(sep)).min().unwrap_or(artist.len());
     artist[..end].trim()
 }
@@ -357,10 +363,11 @@ fn album_meta(v: &Json, size: u32) -> Option<Meta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smtc::State;
+    use crate::smtc::{Player, State};
 
     fn track(title: &str, artist: &str, album: &str) -> Track {
         Track {
+            player: Player::AppleMusic,
             title: title.into(),
             artist: artist.into(),
             album: album.into(),
@@ -536,6 +543,11 @@ mod tests {
         assert_eq!(loose("Song [with Friend]"), "song");
         assert_eq!(loose("Song (Live)"), "song live");
         assert_eq!(loose("Song (Featured)"), "song featured");
+        // Spotify's version suffixes.
+        assert_eq!(loose("Bohemian Rhapsody - Remastered 2011"), "bohemian rhapsody");
+        assert_eq!(loose("Song - 2009 Remaster"), "song");
+        assert_eq!(loose("Song - Live at Wembley"), "song live at wembley");
+        assert_eq!(similarity("Bohemian Rhapsody", "Bohemian Rhapsody - Remastered 2011", 10, 7, 0), 7);
         assert_eq!(similarity("Regulate (feat. Nate Dogg)", "Regulate", 10, 7, 4), 7);
         assert_eq!(similarity("Dr. Dre & Snoop Dogg", "Dr. Dre", 6, 5, 3), 3);
         assert_eq!(similarity("Dreamer", "Dre", 6, 5, 3), 0);

@@ -1,11 +1,11 @@
-//! Turns an Apple Music track into a Discord activity payload.
+//! Turns a track into a Discord activity payload.
 
 use crate::config::Config;
 use crate::itunes::Meta;
 use crate::itunes::norm;
 use crate::json::push_str;
 use crate::prelude::*;
-use crate::smtc::{State, Track};
+use crate::smtc::{Player, State, Track};
 
 /// Discord text fields must be 2..=128 characters.
 const MAX_TEXT: usize = 128;
@@ -13,6 +13,8 @@ const MAX_URL: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Activity {
+    /// Which song this is (player, title, artist, album).
+    song: String,
     /// JSON object members except timestamps.
     fields: String,
     /// (start, end) in Unix ms.
@@ -31,9 +33,10 @@ impl Activity {
         s
     }
 
-    /// Same song and text; timestamps may differ.
-    pub fn same_content(&self, other: &Activity) -> bool {
-        self.fields == other.fields
+    /// The same song, though maybe shown differently (e.g. its album art
+    /// arrived).
+    pub fn same_song(&self, other: &Activity) -> bool {
+        self.song == other.song
     }
 
     /// Equal content, and progress within `tolerance_ms` (so ticking time
@@ -164,12 +167,52 @@ fn member(out: &mut String, key: &str, value: &str) {
     push_str(out, value);
 }
 
+/// Where the track, artist and album link to.
+struct Links {
+    track: String,
+    artist: String,
+    album: String,
+}
+
+/// A Spotify search page (tracks, artists or albums). Windows doesn't give
+/// out Spotify's own ids, and a search for the song lists it first.
+fn spotify_search(query: &str, kind: &str) -> String {
+    let q = crate::http::encode(query).replace('+', "%20"); // a path, not a query string
+    format!("https://open.spotify.com/search/{q}/{kind}")
+}
+
+fn links_for(t: &Track, meta: Option<&Meta>) -> Option<Links> {
+    match t.player {
+        Player::AppleMusic => {
+            meta.map(|m| Links { track: m.track_url.clone(), artist: m.artist_url.clone(), album: m.album_url.clone() })
+        }
+        Player::Spotify => {
+            let artist = crate::itunes::main_artist(&t.artist);
+            let album = album_display(&t.album);
+            Some(Links {
+                track: spotify_search(&format!("{} {artist}", t.title), "tracks"),
+                artist: spotify_search(artist, "artists"),
+                album: if album.is_empty() {
+                    String::new()
+                } else {
+                    spotify_search(&format!("{album} {artist}"), "albums")
+                },
+            })
+        }
+    }
+}
+
 pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<Activity> {
     let paused = t.state == State::Paused;
     if paused && !c.show_paused {
         return None;
     }
-    let links = c.links && meta.is_some();
+    let urls = links_for(t, meta);
+    let links = if c.links { urls.as_ref() } else { None };
+    let (name, fallback_image) = match t.player {
+        Player::AppleMusic => (&c.name, &c.fallback_image),
+        Player::Spotify => (&c.spotify_name, &c.spotify_fallback_image),
+    };
     // "Song — Artist" on the member-list line. The featured-artist credit
     // moves out of the title (it would push the artist out of view) onto the
     // second line; otherwise that line is the album.
@@ -185,13 +228,13 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
     // Where the second line links: the artist, or in "Song — Artist" the
     // album (a featured-artist credit has no link).
     let state_link = match (both, feat.is_empty()) {
-        (false, _) => meta.map(|m| m.artist_url.as_str()),
-        (true, true) => meta.map(|m| m.album_url.as_str()),
+        (false, _) => links.map(|l| l.artist.as_str()),
+        (true, true) => links.map(|l| l.album.as_str()),
         (true, false) => None,
     };
     let display = if both { 2 } else { c.status_display };
     let mut f = format!(r#""type":{},"status_display_type":{display}"#, c.activity_type);
-    if let Some(name) = fit(&c.name) {
+    if let Some(name) = fit(name) {
         member(&mut f, "name", &name);
     }
 
@@ -210,20 +253,20 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
     }
     if let Some(d) = &details {
         member(&mut f, "details", d);
-        if links && url_ok(&meta.unwrap().track_url) {
-            member(&mut f, "details_url", &meta.unwrap().track_url);
+        if let Some(l) = links.filter(|l| url_ok(&l.track)) {
+            member(&mut f, "details_url", &l.track);
         }
     }
     if let Some(s) = &state {
         member(&mut f, "state", s);
-        if let Some(url) = state_link.filter(|u| links && url_ok(u)) {
+        if let Some(url) = state_link.filter(|u| url_ok(u)) {
             member(&mut f, "state_url", url);
         }
     }
 
     let image = match meta {
         Some(m) if c.artwork && url_ok(&m.artwork) => m.artwork.as_str(),
-        _ if url_ok(&c.fallback_image) => c.fallback_image.as_str(),
+        _ if url_ok(fallback_image) => fallback_image.as_str(),
         _ => "",
     };
     if !image.is_empty() {
@@ -232,40 +275,43 @@ pub fn build(t: &Track, meta: Option<&Meta>, c: &Config, now_ms: i64) -> Option<
         if let Some(lt) = &large_text {
             member(&mut f, "large_text", lt);
         }
-        if links && url_ok(&meta.unwrap().album_url) {
-            member(&mut f, "large_url", &meta.unwrap().album_url);
+        if let Some(l) = links.filter(|l| url_ok(&l.album)) {
+            member(&mut f, "large_url", &l.album);
         }
         f.push('}');
     }
 
-    if let Some(m) = meta {
-        let mut buttons = Vec::new();
-        if c.button_listen && url_ok(&m.track_url) {
-            buttons.push(("Listen on Apple Music", m.track_url.clone()));
-        }
-        if c.button_songlink && m.track_id > 0 {
-            buttons.push(("song.link", format!("https://song.link/i/{}", m.track_id)));
-        }
-        if !buttons.is_empty() {
-            f.push_str(r#","buttons":["#);
-            for (i, (label, url)) in buttons.iter().enumerate() {
-                if i > 0 {
-                    f.push(',');
-                }
-                f.push('{');
-                member(&mut f, "label", label);
-                member(&mut f, "url", url);
-                f.push('}');
+    let mut buttons = Vec::new();
+    if let Some(l) = urls.as_ref().filter(|l| c.button_listen && url_ok(&l.track)) {
+        let label = match t.player {
+            Player::AppleMusic => "Listen on Apple Music",
+            Player::Spotify => "Listen on Spotify",
+        };
+        buttons.push((label, l.track.clone()));
+    }
+    if let Some(m) = meta.filter(|m| c.button_songlink && m.track_id > 0) {
+        buttons.push(("song.link", format!("https://song.link/i/{}", m.track_id)));
+    }
+    if !buttons.is_empty() {
+        f.push_str(r#","buttons":["#);
+        for (i, (label, url)) in buttons.iter().enumerate() {
+            if i > 0 {
+                f.push(',');
             }
-            f.push(']');
+            f.push('{');
+            member(&mut f, "label", label);
+            member(&mut f, "url", url);
+            f.push('}');
         }
+        f.push(']');
     }
 
     let ts = (!paused && c.show_progress && t.duration_ms > 0).then(|| {
         let start = now_ms - t.position_ms;
         (start, start + t.duration_ms)
     });
-    Some(Activity { fields: f, ts })
+    let song = format!("{}\0{}\0{}\0{}", t.player.name(), t.title, t.artist, t.album);
+    Some(Activity { song, fields: f, ts })
 }
 
 #[cfg(test)]
@@ -275,6 +321,7 @@ mod tests {
 
     fn track(state: State) -> Track {
         Track {
+            player: Player::AppleMusic,
             title: "GIMME A HUG".into(),
             artist: "Drake".into(),
             album: "$ome $exy $ongs 4 U".into(),
@@ -360,6 +407,7 @@ mod tests {
     #[test]
     fn singles_never_repeat() {
         let t = Track {
+            player: Player::AppleMusic,
             title: "Nena Maldici\u{f3}n (feat. Lenny Tav\u{e1}rez)".into(),
             artist: "Paulo Londra".into(),
             album: "Nena Maldici\u{f3}n (feat. Lenny Tav\u{e1}rez) - Single".into(),
@@ -394,6 +442,58 @@ mod tests {
         assert_eq!(v.str("state"), Some("Homerun"));
         assert_eq!(v.str("state_url"), Some(meta().album_url.as_str()));
         assert!(v.get("assets").unwrap().str("large_text").is_none());
+    }
+
+    #[test]
+    fn spotify() {
+        let t = Track {
+            player: Player::Spotify,
+            title: "Tal Vez".into(),
+            artist: "Paulo Londra".into(),
+            album: "Homerun".into(),
+            state: State::Playing,
+            duration_ms: 263_000,
+            position_ms: 51_000,
+        };
+        let mut c = Config { button_listen: true, ..Config::default() };
+        // No lookup needed for Spotify's own links; Spotify's name and icon.
+        let json = build(&t, None, &c, 0).unwrap().json();
+        let v = json::parse(&json).unwrap();
+        assert_eq!(v.str("name"), Some("Spotify"));
+        assert_eq!(v.str("details_url"), Some("https://open.spotify.com/search/Tal%20Vez%20Paulo%20Londra/tracks"));
+        assert_eq!(v.str("state_url"), Some("https://open.spotify.com/search/Paulo%20Londra/artists"));
+        let assets = v.get("assets").unwrap();
+        assert_eq!(assets.str("large_image"), Some(c.spotify_fallback_image.as_str()));
+        assert_eq!(assets.str("large_url"), Some("https://open.spotify.com/search/Homerun%20Paulo%20Londra/albums"));
+        assert_eq!(v.arr("buttons")[0].str("label"), Some("Listen on Spotify"));
+        assert_eq!(v.arr("buttons")[0].str("url"), v.str("details_url"));
+
+        // With the lookup: album art and song.link, but never Apple Music links.
+        c.button_songlink = true;
+        let json = build(&t, Some(&meta()), &c, 0).unwrap().json();
+        let v = json::parse(&json).unwrap();
+        assert_eq!(v.get("assets").unwrap().str("large_image"), Some(meta().artwork.as_str()));
+        assert_eq!(v.arr("buttons")[1].str("url"), Some("https://song.link/i/3"));
+        assert!(!json.contains("music.apple.com") && !json.contains("Apple Music"), "{json}");
+
+        // Song — Artist: the second line (album) links to the album search.
+        let c2 = Config { status_display: crate::config::SONG_ARTIST, ..Config::default() };
+        let v = json::parse(&build(&t, None, &c2, 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("details"), Some("Tal Vez \u{2014} Paulo Londra"));
+        assert_eq!(v.str("state_url"), Some("https://open.spotify.com/search/Homerun%20Paulo%20Londra/albums"));
+
+        // Collaborations search for the main artist; odd characters are escaped.
+        let mut t2 = t.clone();
+        t2.title = "AC/DC & Me?".into();
+        t2.artist = "A, B & C".into();
+        let v = json::parse(&build(&t2, None, &Config::default(), 0).unwrap().json()).unwrap();
+        assert_eq!(v.str("details_url"), Some("https://open.spotify.com/search/AC%2FDC%20%26%20Me%3F%20A/tracks"));
+        assert_eq!(v.str("state_url"), Some("https://open.spotify.com/search/A/artists"));
+
+        // Links off: no links at all.
+        let c3 = Config { links: false, ..Config::default() };
+        let json = build(&t, None, &c3, 0).unwrap().json();
+        assert!(!json.contains("_url"), "{json}");
     }
 
     #[test]
@@ -453,6 +553,14 @@ mod tests {
         let s = build(&seek, None, &c, 10_000).unwrap();
         assert!(a.same_as(&b, 2500));
         assert!(!a.same_as(&s, 2500));
+        let with_art = build(&track(State::Playing), Some(&meta()), &c, 10_000).unwrap();
+        assert!(with_art.same_song(&a) && !with_art.same_as(&a, 2500));
+        let mut other = track(State::Playing);
+        other.title = "Other".into();
+        assert!(!build(&other, None, &c, 10_000).unwrap().same_song(&a));
+        other = track(State::Playing);
+        other.player = Player::Spotify;
+        assert!(!build(&other, None, &c, 10_000).unwrap().same_song(&a));
     }
 
     #[test]

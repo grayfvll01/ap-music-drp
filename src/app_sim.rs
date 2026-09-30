@@ -1,5 +1,5 @@
-//! Test-only stand-ins for everything the worker talks to (clock, Apple
-//! Music, Discord, iTunes, the config file), driven by a virtual clock, and
+//! Test-only stand-ins for everything the worker talks to (clock, the music
+//! player, Discord, iTunes, the config file), driven by a virtual clock, and
 //! scenario tests of the worker's promises:
 //! - Discord never shows a song that stopped playing more than STALE_MS ago.
 //! - What's playing shows up promptly, and the loop never spins.
@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(10_000_000) };
-    /// Apple Music right now: the track and when it (re)started playing.
+    /// The player right now: the track and when it (re)started playing.
     static PLAYER: RefCell<Option<(Track, i64)>> = const { RefCell::new(None) };
     static LOOKUP_MS: Cell<i64> = const { Cell::new(0) };
     static LOOKUP_FAIL: Cell<bool> = const { Cell::new(false) };
@@ -156,9 +156,9 @@ impl Lookup {
 pub struct Smtc;
 
 impl Smtc {
-    pub fn poll(&mut self) -> windows::core::Result<Option<Track>> {
+    pub fn poll(&mut self, players: &[Player]) -> windows::core::Result<Option<Track>> {
         Ok(PLAYER.with(|p| {
-            p.borrow().as_ref().map(|(t, since)| {
+            p.borrow().as_ref().filter(|(t, _)| players.contains(&t.player)).map(|(t, since)| {
                 let mut t = t.clone();
                 if t.state == State::Playing {
                     t.position_ms = (t.position_ms + clock() - since).min(t.duration_ms);
@@ -183,6 +183,7 @@ struct History {
 
 fn track(title: &str) -> Track {
     Track {
+        player: Player::AppleMusic,
         title: title.into(),
         artist: "Artist".into(),
         album: "Album".into(),
@@ -207,7 +208,12 @@ impl History {
     }
 
     fn play(&mut self, title: &str) {
-        PLAYER.with(|p| *p.borrow_mut() = Some((track(title), clock())));
+        self.play_on(Player::AppleMusic, title);
+    }
+
+    fn play_on(&mut self, player: Player, title: &str) {
+        let t = Track { player, ..track(title) };
+        PLAYER.with(|p| *p.borrow_mut() = Some((t, clock())));
         self.set(Some(title));
     }
 
@@ -247,6 +253,15 @@ impl History {
     }
 }
 
+/// Edits the settings "file"; the worker notices on its next poll.
+fn edit_config(f: impl FnOnce(&mut Config)) {
+    CFG.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 += 1;
+        f(&mut c.1);
+    });
+}
+
 fn showing() -> Option<String> {
     DC.with(|d| d.borrow().showing.clone())
 }
@@ -266,6 +281,17 @@ fn run(w: &mut Worker, h: &History, ms: i64) {
         } else {
             spins = 0;
         }
+        advance(sleep);
+    }
+}
+
+/// Like `run`, and Discord must show something the whole time.
+fn run_never_blank(w: &mut Worker, h: &History, ms: i64) {
+    let end = clock() + ms;
+    while clock() < end {
+        let sleep = w.tick() as i64;
+        h.check();
+        assert!(showing().is_some(), "the status blinked off between songs");
         advance(sleep);
     }
 }
@@ -368,11 +394,7 @@ fn worker_scenarios() {
     assert_eq!(showing().as_deref(), Some("A"));
 
     // A config edit is picked up (here: keep showing while paused).
-    CFG.with(|c| {
-        let mut c = c.borrow_mut();
-        c.0 += 1;
-        c.1.show_paused = true;
-    });
+    edit_config(|c| c.show_paused = true);
     run(&mut w, &h, 1500);
     PLAYER.with(|p| p.borrow_mut().as_mut().unwrap().0.state = State::Paused);
     run(&mut w, &h, 3000);
@@ -385,14 +407,41 @@ fn worker_scenarios() {
     run(&mut w, &h, 4000);
     assert_eq!(showing().as_deref(), Some("First"));
     h.play("Second");
-    let end = clock() + 5000;
-    while clock() < end {
-        let sleep = w.tick() as i64;
-        h.check();
-        assert!(showing().is_some(), "the status blinked off between songs");
-        advance(sleep);
-    }
+    run_never_blank(&mut w, &h, 5000);
     assert_eq!(showing().as_deref(), Some("Second"));
+    // ...also when that uses the last of Discord's 5 updates per 20 s (each
+    // song is sent twice: at once, then with its art): the art waits for a
+    // free update instead of the song coming down.
+    h.play("Third");
+    run_never_blank(&mut w, &h, 3000);
+    assert_eq!(showing().as_deref(), Some("Third"));
+
+    // Spotify works the same way, and turning a player off in the menu takes
+    // its song down at once (and turning it back on brings it back).
+    let (mut w, mut h) = reset(true, 850);
+    h.play_on(Player::Spotify, "S");
+    run(&mut w, &h, 3000);
+    assert_eq!(showing().as_deref(), Some("S"));
+    edit_config(|c| c.spotify = false);
+    h.set(None);
+    run(&mut w, &h, 1100);
+    assert_eq!(showing(), None, "Spotify turned off");
+    edit_config(|c| c.spotify = true);
+    h.set(Some("S"));
+    run(&mut w, &h, 3000);
+    assert_eq!(showing().as_deref(), Some("S"));
+    // Switching players replaces the song directly too.
+    h.play("A");
+    run_never_blank(&mut w, &h, 3000);
+    assert_eq!(showing().as_deref(), Some("A"));
+    edit_config(|c| c.apple_music = false);
+    h.set(None);
+    run(&mut w, &h, 1100);
+    assert_eq!(showing(), None, "Apple Music turned off");
+    assert_eq!(SHARED.status.with(|s| s.playing.clone()), "Spotify: nothing playing");
+    edit_config(|c| c.spotify = false);
+    run(&mut w, &h, 1100);
+    assert_eq!(SHARED.status.with(|s| s.playing.clone()), "Apple Music and Spotify are both turned off");
 
     SHARED.enabled.store(true, SeqCst);
 }

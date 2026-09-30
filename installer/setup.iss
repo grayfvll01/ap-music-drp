@@ -54,7 +54,7 @@ Name: "startup"; Description: "Start with Windows"; Check: not IsUpgrade
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Show your Apple Music songs on Discord"
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Show your Apple Music and Spotify songs on Discord"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Registry]

@@ -1,4 +1,5 @@
-//! Apple Music Discord Presence: Discord Rich Presence for Apple Music on Windows.
+//! Apple Music Discord Presence: Discord Rich Presence for Apple Music (and
+//! Spotify) on Windows.
 //!
 //! Everything lives in this library so it can be unit-tested with `std`;
 //! the shipped exe (`main.rs`) uses it without `std` to stay tiny.

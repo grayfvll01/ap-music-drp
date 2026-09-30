@@ -1,9 +1,10 @@
-//! Reads the Apple Music session from Windows' media controls (SMTC).
+//! Reads the Apple Music and Spotify sessions from Windows' media controls
+//! (SMTC).
 //!
-//! Every other media session (browsers, Spotify, games, video players, ...) is
-//! skipped by an exact package-identity check, so nothing else can ever reach
-//! Discord. `GetCurrentSession()` is deliberately never used: it returns
-//! whichever app Windows considers "current", which may not be Apple Music.
+//! Every other media session (browsers, web players, games, video players,
+//! ...) is skipped by an exact app-identity check, so nothing else can ever
+//! reach Discord. `GetCurrentSession()` is deliberately never used: it
+//! returns whichever app Windows considers "current", which may be any app.
 
 use crate::prelude::*;
 use crate::sys::{self, EPOCH_DIFF};
@@ -17,9 +18,37 @@ use windows::Media::Control::{
 /// shares the publisher hash and the "!App" part, iTunes/Cider/browsers/the
 /// web player all use other ids.
 const APPLE_MUSIC_AUMID: &str = "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App";
+/// Spotify's desktop app (a plain exe, so its id is the file name) and its
+/// Microsoft Store package. The web player plays inside a browser, whose id
+/// is the browser's.
+const SPOTIFY_AUMIDS: [&str; 2] = ["Spotify.exe", "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"];
 
-pub fn is_apple_music(aumid: &str) -> bool {
-    aumid.eq_ignore_ascii_case(APPLE_MUSIC_AUMID)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Player {
+    AppleMusic,
+    Spotify,
+}
+
+impl Player {
+    pub const ALL: [Player; 2] = [Player::AppleMusic, Player::Spotify];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Player::AppleMusic => "Apple Music",
+            Player::Spotify => "Spotify",
+        }
+    }
+
+    /// The player a media session belongs to, by its exact app id.
+    pub fn of(aumid: &str) -> Option<Player> {
+        if aumid.eq_ignore_ascii_case(APPLE_MUSIC_AUMID) {
+            Some(Player::AppleMusic)
+        } else if SPOTIFY_AUMIDS.iter().any(|id| aumid.eq_ignore_ascii_case(id)) {
+            Some(Player::Spotify)
+        } else {
+            None
+        }
+    }
 }
 
 /// Waits for a WinRT async result, giving up after 3 s. Not `join()`: in
@@ -53,6 +82,7 @@ pub enum State {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track {
+    pub player: Player,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -107,47 +137,99 @@ pub fn tidy(title: &str, artist: &str, album_title: &str) -> Option<(String, Str
     Some((title.to_string(), artist.to_string(), album.to_string()))
 }
 
+/// Spotify's fields are already clean (Title, Artist, AlbumTitle); `None`
+/// for ads and for the idle "Spotify" placeholder, which have no real artist.
+pub fn tidy_spotify(title: &str, artist: &str, album: &str) -> Option<(String, String, String)> {
+    let (title, artist) = (title.trim(), artist.trim());
+    if title.is_empty() || artist.is_empty() || artist.eq_ignore_ascii_case("Spotify") {
+        return None;
+    }
+    if ["Advertisement", "Spotify", "Spotify Free", "Spotify Premium"].iter().any(|x| title.eq_ignore_ascii_case(x)) {
+        return None;
+    }
+    Some((title.to_string(), artist.to_string(), album.trim().to_string()))
+}
+
+/// The session to show when several players have one: playing beats
+/// switching tracks beats paused; on a tie the player shown last stays,
+/// else Apple Music.
+pub fn pick(tracks: impl IntoIterator<Item = Track>, last: Option<Player>) -> Option<Track> {
+    let rank = |t: &Track| {
+        let state = match t.state {
+            State::Playing => 2,
+            State::Changing => 1,
+            State::Paused => 0,
+        };
+        (state, Some(t.player) == last, t.player == Player::AppleMusic)
+    };
+    let mut best: Option<Track> = None;
+    for t in tracks {
+        if best.as_ref().is_none_or(|b| rank(&t) > rank(b)) {
+            best = Some(t);
+        }
+    }
+    best
+}
+
 #[derive(Default)]
 pub struct Smtc {
     mgr: Option<Manager>,
+    /// The player picked last time (see `pick`).
+    last: Option<Player>,
 }
 
 impl Smtc {
-    /// `Ok(None)` when Apple Music has no active session.
-    pub fn poll(&mut self) -> windows::core::Result<Option<Track>> {
-        let r = self.poll_inner();
-        if r.is_err() {
-            self.mgr = None; // re-acquire on the next poll
+    /// What the enabled `players` are playing; `Ok(None)` when none of them
+    /// has an active session.
+    pub fn poll(&mut self, players: &[Player]) -> windows::core::Result<Option<Track>> {
+        let r = self.poll_inner(players);
+        match &r {
+            Ok(Some(t)) => self.last = Some(t.player),
+            Ok(None) => {}
+            Err(_) => self.mgr = None, // re-acquire on the next poll
         }
         r
     }
 
-    fn poll_inner(&mut self) -> windows::core::Result<Option<Track>> {
+    fn poll_inner(&mut self, players: &[Player]) -> windows::core::Result<Option<Track>> {
         if self.mgr.is_none() {
             self.mgr = Some(wait!(Manager::RequestAsync()?)?);
         }
         let sessions = self.mgr.as_ref().unwrap().GetSessions()?;
-        let mut found = None;
+        // Each player's session (by `Player::ALL` index), and whether a second
+        // one claimed to be that player: Windows doesn't verify session ids,
+        // so one of them is an impostor, and that player is skipped.
+        let mut found: [Option<Session>; 2] = [None, None];
+        let mut impostor = [false; 2];
         for i in 0..sessions.Size()? {
             let s = sessions.GetAt(i)?;
-            if is_apple_music(&s.SourceAppUserModelId()?.to_string_lossy()) {
-                if found.is_some() {
-                    // Windows doesn't verify session ids; two "Apple Music"
-                    // sessions means one is an impostor. Show nothing.
-                    return Ok(None);
-                }
-                found = Some(s);
+            let Some(p) = Player::of(&s.SourceAppUserModelId()?.to_string_lossy()) else { continue };
+            if players.contains(&p) {
+                impostor[p as usize] |= found[p as usize].is_some();
+                found[p as usize] = Some(s);
             }
         }
-        match found {
-            Some(s) => read(&s),
-            None => Ok(None),
+        let mut tracks = [None, None];
+        let mut error = None;
+        for (i, p) in Player::ALL.into_iter().enumerate() {
+            match found[i].as_ref().filter(|_| !impostor[i]).map(|s| read(p, s)) {
+                Some(Ok(t)) => tracks[i] = t,
+                Some(Err(e)) => error = Some(e),
+                None => {}
+            }
+        }
+        // A player that couldn't be read might be the one playing: fail
+        // closed (show nothing) unless another one definitely is.
+        match (pick(tracks.into_iter().flatten(), self.last), error) {
+            (Some(t), _) if t.state == State::Playing => Ok(Some(t)),
+            (_, Some(e)) => Err(e),
+            (t, None) => Ok(t),
         }
     }
 
     /// Diagnostic listing of every session's app id (used by `--dump`).
     pub fn session_ids(&mut self) -> Vec<String> {
-        let _ = self.poll();
+        let _ = self.poll(&[]);
         let Some(mgr) = &self.mgr else { return Vec::new() };
         let Ok(sessions) = mgr.GetSessions() else { return Vec::new() };
         (0..sessions.Size().unwrap_or(0))
@@ -157,7 +239,7 @@ impl Smtc {
     }
 }
 
-fn read(s: &Session) -> windows::core::Result<Option<Track>> {
+fn read(player: Player, s: &Session) -> windows::core::Result<Option<Track>> {
     let state = match s.GetPlaybackInfo()?.PlaybackStatus()? {
         Status::Playing => State::Playing,
         Status::Paused => State::Paused,
@@ -165,14 +247,15 @@ fn read(s: &Session) -> windows::core::Result<Option<Track>> {
         _ => return Ok(None), // Stopped / Closed
     };
     let props = wait!(s.TryGetMediaPropertiesAsync()?)?;
-    let fields = tidy(
-        &props.Title()?.to_string_lossy(),
-        &props.Artist()?.to_string_lossy(),
-        &props.AlbumTitle()?.to_string_lossy(),
-    );
-    // Placeholders (loading, station names) are treated as a transition; the
-    // worker clears the presence if they persist.
-    let Some((title, artist, album)) = fields else { return Ok(Some(changing())) };
+    let (title, artist, album) =
+        (props.Title()?.to_string_lossy(), props.Artist()?.to_string_lossy(), props.AlbumTitle()?.to_string_lossy());
+    let fields = match player {
+        Player::AppleMusic => tidy(&title, &artist, &album),
+        Player::Spotify => tidy_spotify(&title, &artist, &album),
+    };
+    // Placeholders (loading, station names, ads) are treated as a
+    // transition; the worker clears the presence if they persist.
+    let Some((title, artist, album)) = fields else { return Ok(Some(changing(player))) };
 
     let tl = s.GetTimelineProperties()?;
     let start = tl.StartTime()?.Duration;
@@ -186,11 +269,12 @@ fn read(s: &Session) -> windows::core::Result<Option<Track>> {
         }
     }
     let position_ms = if duration_ms > 0 { position_ms.clamp(0, duration_ms) } else { position_ms.max(0) };
-    Ok(Some(Track { title, artist, album, state, duration_ms, position_ms }))
+    Ok(Some(Track { player, title, artist, album, state, duration_ms, position_ms }))
 }
 
-fn changing() -> Track {
+fn changing(player: Player) -> Track {
     Track {
+        player,
         title: String::new(),
         artist: String::new(),
         album: String::new(),
@@ -206,13 +290,26 @@ mod tests {
 
     #[test]
     fn identity() {
-        assert!(is_apple_music("AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"));
-        assert!(is_apple_music("appleinc.applemusicwin_NZYJ5CX40TTQA!APP"));
+        let apple = Some(Player::AppleMusic);
+        let spotify = Some(Player::Spotify);
+        assert_eq!(Player::of("AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"), apple);
+        assert_eq!(Player::of("appleinc.applemusicwin_NZYJ5CX40TTQA!APP"), apple);
+        assert_eq!(Player::of("Spotify.exe"), spotify);
+        assert_eq!(Player::of("spotify.EXE"), spotify);
+        assert_eq!(Player::of("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), spotify);
         for other in [
             "Chrome",
-            "Spotify.exe",
             "msedge.exe",
-            "308046B0AF4A39CB", // Firefox
+            "firefox.exe",
+            "Spotify",
+            "Spotify.exe ",
+            "SpotifyWebHelper.exe",
+            "Spotify.exe.evil",
+            "C:\\Evil\\Spotify.exe",
+            "SpotifyAB.SpotifyMusic_zpdnekdrzrea0",
+            "SpotifyAB.SpotifyMusic_evil!Spotify",
+            "open.spotify.com-8B0B9F5_7vh1tm7h3g5s0!App", // web player PWA
+            "308046B0AF4A39CB",                           // Firefox
             "AppleMusic.exe",
             "iTunes.exe",
             "AppleInc.iTunes_nzyj5cx40ttqa!iTunes",
@@ -230,8 +327,49 @@ mod tests {
             "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App!x",
             "",
         ] {
-            assert!(!is_apple_music(other), "{other}");
+            assert_eq!(Player::of(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn spotify_fields() {
+        assert_eq!(tidy_spotify(" Tal Vez ", "Paulo Londra", "Homerun"), some("Tal Vez", "Paulo Londra", "Homerun"));
+        // Dashes are part of Spotify's names, not packed fields.
+        assert_eq!(
+            tidy_spotify("Song - Remastered 2011", "A \u{2014} B", ""),
+            some("Song - Remastered 2011", "A \u{2014} B", "")
+        );
+        for (title, artist) in
+            [("Advertisement", "Brand"), ("Spotify", ""), ("Spotify Free", "Spotify"), ("Song", ""), ("", "Artist")]
+        {
+            assert_eq!(tidy_spotify(title, artist, ""), None, "{title} / {artist}");
+        }
+    }
+
+    #[test]
+    fn picks_the_player_in_use() {
+        let tr = |p: Player, state: State| Track {
+            player: p,
+            title: p.name().into(),
+            artist: "A".into(),
+            album: String::new(),
+            state,
+            duration_ms: 0,
+            position_ms: 0,
+        };
+        let who = |v: Vec<Track>, last| pick(v, last).map(|t| t.player);
+        use Player::*;
+        use State::*;
+        assert_eq!(who(vec![], None), None);
+        assert_eq!(who(vec![tr(Spotify, Paused)], None), Some(Spotify));
+        assert_eq!(who(vec![tr(AppleMusic, Paused), tr(Spotify, Playing)], None), Some(Spotify));
+        assert_eq!(who(vec![tr(Spotify, Paused), tr(AppleMusic, Playing)], Some(Spotify)), Some(AppleMusic));
+        assert_eq!(who(vec![tr(AppleMusic, Changing), tr(Spotify, Paused)], None), Some(AppleMusic));
+        // Ties: the one already shown stays, else Apple Music.
+        assert_eq!(who(vec![tr(Spotify, Playing), tr(AppleMusic, Playing)], None), Some(AppleMusic));
+        assert_eq!(who(vec![tr(AppleMusic, Playing), tr(Spotify, Playing)], Some(Spotify)), Some(Spotify));
+        assert_eq!(who(vec![tr(AppleMusic, Paused), tr(Spotify, Paused)], Some(Spotify)), Some(Spotify));
+        assert_eq!(who(vec![tr(Spotify, Paused), tr(AppleMusic, Paused)], Some(AppleMusic)), Some(AppleMusic));
     }
 
     fn t(title: &str, artist: &str, album: &str) -> Option<(String, String, String)> {

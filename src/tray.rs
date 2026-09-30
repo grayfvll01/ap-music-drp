@@ -35,8 +35,10 @@ const ID_SWITCH: usize = 20;
 /// Status text choices, in `status_display` order (name, state, details, song — artist).
 const ID_STATUS: usize = 40;
 
+const SWITCHES: usize = 9;
+
 /// The on/off settings in the menu: (config key, current value).
-fn switches(c: &config::Config) -> [(&'static str, bool); 7] {
+fn switches(c: &config::Config) -> [(&'static str, bool); SWITCHES] {
     [
         ("artwork", c.artwork),
         ("show_progress", c.show_progress),
@@ -45,20 +47,24 @@ fn switches(c: &config::Config) -> [(&'static str, bool); 7] {
         ("button_listen", c.button_listen),
         ("button_songlink", c.button_songlink),
         ("update_check", c.update_check),
+        ("apple_music", c.apple_music),
+        ("spotify", c.spotify),
     ]
 }
 
-const SWITCH_TEXT: [PCWSTR; 7] = [
+const SWITCH_TEXT: [PCWSTR; SWITCHES] = [
     w!("Album art"),
     w!("Time bar"),
     w!("Keep showing when paused"),
     w!("Clickable song, artist and album"),
-    w!("\"Listen on Apple Music\""),
+    w!("\"Listen on Apple Music\" (or Spotify)"),
     w!("\"song.link\" (any streaming service)"),
     w!("Check for updates automatically"),
+    w!("Apple Music"),
+    w!("Spotify"),
 ];
 const STATUS_TEXT: [PCWSTR; 4] = [
-    w!("Listening to Apple Music"),
+    w!("Listening to Apple Music / Spotify"),
     w!("Listening to <artist>"),
     w!("Listening to <song>"),
     w!("Listening to <song> \u{2014} <artist>"),
@@ -121,7 +127,7 @@ unsafe fn run_tray() {
         config::migrate();
         let _ = tray(NIM_ADD);
         if first_run {
-            balloon("Your Apple Music songs now show on Discord.\nClick the music note here for options.");
+            balloon("Your Apple Music and Spotify songs now show on Discord.\nClick the music note here for options.");
         }
         if !sys::spawn(app::run) {
             return;
@@ -273,6 +279,11 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         item(menu, check(SHARED.enabled.load(SeqCst)), ID_TOGGLE, w!("Show on Discord"));
         line(menu);
+        submenu(menu, w!("Music apps"), &|m| {
+            for i in 7..9 {
+                item(m, check(sw[i].1), ID_SWITCH + i, SWITCH_TEXT[i]);
+            }
+        });
         submenu(menu, w!("Status text"), &|m| {
             for (i, text) in STATUS_TEXT.into_iter().enumerate() {
                 item(m, check(cfg.status_display as usize == i), ID_STATUS + i, text);
@@ -350,7 +361,7 @@ fn command(hwnd: HWND, id: usize) {
             config::set("status_display", STATUS_VALUE[id - ID_STATUS]);
             false
         }
-        _ if (ID_SWITCH..ID_SWITCH + 7).contains(&id) => {
+        _ if (ID_SWITCH..ID_SWITCH + SWITCHES).contains(&id) => {
             let (key, on) = switches(&config::load().unwrap_or_default())[id - ID_SWITCH];
             config::set(key, if on { "false" } else { "true" });
             false
@@ -442,14 +453,19 @@ fn dump(send: bool) {
     out(format!("{} {}\nconfig: {}", crate::APP_NAME, env!("CARGO_PKG_VERSION"), config::path()));
     let mut s = smtc::Smtc::default();
     out("media sessions:".into());
+    let players = app::players(&cfg);
     for id in s.session_ids() {
-        let tag = if smtc::is_apple_music(&id) { "APPLE MUSIC" } else { "ignored" };
+        let tag = match smtc::Player::of(&id) {
+            Some(p) if players.contains(&p) => p.name(),
+            Some(_) => "turned off",
+            None => "ignored",
+        };
         out(format!("  {id}  [{tag}]"));
     }
     let now = sys::now_ms();
-    let track = match s.poll() {
+    let track = match s.poll(&players) {
         Ok(Some(t)) => t,
-        Ok(None) => return out("apple music: nothing playing".into()),
+        Ok(None) => return out("nothing playing".into()),
         Err(e) => return out(format!("error: {:#x}", e.code().0)),
     };
     let state = match track.state {
@@ -458,14 +474,15 @@ fn dump(send: bool) {
         smtc::State::Changing => "changing",
     };
     out(format!(
-        "apple music: title=\"{}\" artist=\"{}\" album=\"{}\" {state} {}s/{}s",
+        "{}: title=\"{}\" artist=\"{}\" album=\"{}\" {state} {}s/{}s",
+        track.player.name(),
         track.title,
         track.artist,
         track.album,
         track.position_ms / 1000,
         track.duration_ms / 1000
     ));
-    let meta = app::wants_lookup(&cfg)
+    let meta = app::wants_lookup(&cfg, track.player)
         .then(|| itunes::Lookup::new().find(&track, &app::country(&cfg), cfg.artwork_size))
         .flatten();
     match &meta {

@@ -13,7 +13,10 @@ pub const SONG_ARTIST: u8 = 3;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub client_id: String,
+    pub apple_music: bool,
+    pub spotify: bool,
     pub name: String,
+    pub spotify_name: String,
     pub activity_type: u8,
     pub status_display: u8,
     pub details: String,
@@ -26,6 +29,7 @@ pub struct Config {
     pub links: bool,
     pub country: String,
     pub fallback_image: String,
+    pub spotify_fallback_image: String,
     pub button_listen: bool,
     pub button_songlink: bool,
     pub poll_ms: u32,
@@ -45,7 +49,10 @@ impl Config {
     fn base() -> Self {
         Config {
             client_id: String::new(),
+            apple_music: true,
+            spotify: true,
             name: String::new(),
+            spotify_name: String::new(),
             activity_type: 2,
             status_display: 0,
             details: "{title}".into(),
@@ -58,6 +65,7 @@ impl Config {
             links: true,
             country: "auto".into(),
             fallback_image: String::new(),
+            spotify_fallback_image: String::new(),
             button_listen: false,
             button_songlink: false,
             poll_ms: 1000,
@@ -106,7 +114,10 @@ pub fn parse_into(mut c: Config, text: &str) -> Config {
         };
         match k.as_str() {
             "client_id" if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => c.client_id = v.into(),
+            "apple_music" => set_bool(&mut c.apple_music),
+            "spotify" => set_bool(&mut c.spotify),
             "name" => c.name = text.into(),
+            "spotify_name" => c.spotify_name = text.into(),
             "activity_type" => {
                 c.activity_type = match v.to_ascii_lowercase().as_str() {
                     "playing" => 0,
@@ -142,6 +153,9 @@ pub fn parse_into(mut c: Config, text: &str) -> Config {
                 c.country = v.to_ascii_lowercase()
             }
             "fallback_image" if v.is_empty() || v.starts_with("https://") => c.fallback_image = v.into(),
+            "spotify_fallback_image" if v.is_empty() || v.starts_with("https://") => {
+                c.spotify_fallback_image = v.into()
+            }
             "button_listen" => set_bool(&mut c.button_listen),
             "button_songlink" => set_bool(&mut c.button_songlink),
             "poll_ms" => {
@@ -273,6 +287,12 @@ mod tests {
         let c = Config::default();
         assert!(!c.client_id.is_empty());
         assert_eq!(c.activity_type, 2);
+        assert!(c.apple_music && c.spotify);
+        assert_eq!((c.name.as_str(), c.spotify_name.as_str()), ("Apple Music", "Spotify"));
+        assert!(c.spotify_fallback_image.starts_with("https://") && c.spotify_fallback_image != c.fallback_image);
+        // A file from before Spotify support gets its defaults.
+        let old = parse_into(Config::default(), "name = Apple Music\r\nlinks = false\r\n");
+        assert!(old.spotify && old.spotify_name == "Spotify" && !old.links);
     }
 
     #[test]

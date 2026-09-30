@@ -1,18 +1,19 @@
-//! Background worker: Apple Music -> presence -> Discord, plus shared UI state.
+//! Background worker: Apple Music / Spotify -> presence -> Discord, plus
+//! shared UI state.
 //!
 //! Rules that keep the status honest:
-//! - Nothing is shown unless the Apple Music session says so right now.
-//! - The previous song is never kept up for more than HOLD_MS while Apple
-//!   Music is between states; clearing is immediate and never rate-limited.
+//! - Nothing is shown unless the player's session says so right now.
+//! - The previous song is never kept up for more than HOLD_MS while the
+//!   player is between states; clearing is immediate and never rate-limited.
 //! - If Discord refuses an update, the connection is dropped, which is
 //!   guaranteed to clear our activity.
 
 use crate::config::Config;
 use crate::prelude::*;
 use crate::presence::{self, Activity};
-use crate::smtc::{State, Track};
+use crate::smtc::{Player, State, Track};
 use crate::sys::Lock;
-// Tests swap the outside world (clock, Apple Music, Discord, iTunes, config
+// Tests swap the outside world (clock, the player, Discord, iTunes, config
 // file) for a scripted simulation; see app_sim.rs.
 #[cfg(test)]
 #[path = "app_sim.rs"]
@@ -36,7 +37,7 @@ pub const WM_STATUS: u32 = WM_APP + 2;
 /// Timestamps closer than this are "the same" (avoids needless updates).
 const SEEK_TOLERANCE_MS: i64 = 2500;
 /// A new track/state must look the same for this long before it's published
-/// (Apple Music briefly reports half-updated metadata while switching).
+/// (players briefly report half-updated metadata while switching).
 const SETTLE_MS: i64 = 600;
 /// Longest a loading / half-updated state may keep the previous song up.
 const HOLD_MS: i64 = 5000;
@@ -160,8 +161,22 @@ pub fn country(cfg: &Config) -> String {
     PARENT.iter().find(|(t, _)| *t == geo).map_or(geo.clone(), |(_, p)| p.to_string())
 }
 
-pub fn wants_lookup(cfg: &Config) -> bool {
-    cfg.artwork || cfg.links || cfg.button_listen || cfg.button_songlink
+/// Whether a song from `player` needs the iTunes lookup (Spotify's links
+/// don't).
+pub fn wants_lookup(cfg: &Config, player: Player) -> bool {
+    cfg.artwork || cfg.button_songlink || (player == Player::AppleMusic && (cfg.links || cfg.button_listen))
+}
+
+/// The players turned on in the settings, in order of preference.
+pub fn players(cfg: &Config) -> Vec<Player> {
+    let mut v = Vec::new();
+    if cfg.apple_music {
+        v.push(Player::AppleMusic);
+    }
+    if cfg.spotify {
+        v.push(Player::Spotify);
+    }
+    v
 }
 
 fn describe(t: &Track) -> String {
@@ -170,10 +185,10 @@ fn describe(t: &Track) -> String {
 
 /// What a track "is" for settling purposes (duration in whole seconds, since
 /// the ms value can wobble).
-type Ident = (String, String, String, State, i64);
+type Ident = (Player, String, String, String, State, i64);
 
 fn ident(t: &Track) -> Ident {
-    (t.title.clone(), t.artist.clone(), t.album.clone(), t.state, t.duration_ms / 1000)
+    (t.player, t.title.clone(), t.artist.clone(), t.album.clone(), t.state, t.duration_ms / 1000)
 }
 
 enum Want {
@@ -338,8 +353,9 @@ impl Worker {
 
         let enabled = SHARED.enabled.load(SeqCst);
         let now = sys::now_ms();
-        let track = if enabled {
-            self.smtc.poll().unwrap_or_else(|e| {
+        let players = players(&self.cfg);
+        let track = if enabled && !players.is_empty() {
+            self.smtc.poll(&players).unwrap_or_else(|e| {
                 log(&self.cfg, &format!("media session error {:#x}", e.code().0));
                 None // fail closed: show nothing
             })
@@ -382,12 +398,12 @@ impl Worker {
                 self.ensure_connected(mono);
                 let mut act = None;
                 if self.dc.is_some() {
-                    let (size, lookup) = (self.cfg.artwork_size, wants_lookup(&self.cfg));
+                    let (size, lookup) = (self.cfg.artwork_size, wants_lookup(&self.cfg, t.player));
                     if lookup && !self.lookup.cached(&t, &self.country, size) {
                         // A lookup can take seconds: put the new song up
                         // straight away (replacing the old one, without art
                         // or links), then look it up. The next poll re-checks
-                        // Apple Music and the toggle, and adds the art.
+                        // the player and the toggle, and adds the art.
                         let now_playing = presence::build(&t, None, &self.cfg, now);
                         self.sync(now_playing, mono);
                         self.lookup.find(&t, &self.country, size);
@@ -403,7 +419,7 @@ impl Worker {
         };
 
         let now_playing = match &shown_track {
-            Some(t) => Some(describe(t)),
+            Some(t) => Some(format!("{} [{}]", describe(t), t.player.name())),
             None if self.ident.is_none() => Some(String::from("(nothing)")),
             None => None, // in between: not worth a log line
         };
@@ -415,21 +431,26 @@ impl Worker {
         self.sync(desired, mono);
 
         // Tray status.
+        let player = self.ident.as_ref().map_or("", |i| i.0.name());
         self.playing_line = if !enabled {
             "Hidden from Discord".into()
         } else if let Some(t) = &shown_track {
             let icon = if t.state == State::Paused { '\u{23F8}' } else { '\u{25B6}' };
             format!("{icon} {}", describe(t))
         } else if self.ident.is_none() {
-            "Apple Music: nothing playing".into()
+            match players.as_slice() {
+                [] => "Apple Music and Spotify are both turned off".into(),
+                [p] => format!("{}: nothing playing", p.name()),
+                _ => "Nothing playing".into(),
+            }
         } else if hold_expired {
-            "Apple Music: loading\u{2026}".into()
-        } else if matches!(self.ident, Some((_, _, _, State::Paused, _))) {
-            "Apple Music: paused".into()
+            format!("{player}: loading\u{2026}")
+        } else if matches!(self.ident, Some((_, _, _, _, State::Paused, _))) {
+            format!("{player}: paused")
         } else if holding {
             core::mem::take(&mut self.playing_line) // keep the last line while switching
         } else {
-            "Apple Music: nothing to show".into() // every line templated away
+            format!("{player}: nothing to show") // every line templated away
         };
         let refusing =
             self.shown.is_none() && self.rejected.as_ref().is_some_and(|(_, at)| mono - at < REJECT_COOLDOWN_MS);
@@ -474,8 +495,9 @@ impl Worker {
             Some(_) if !SHARED.enabled.load(SeqCst) || SHARED.quit.load(SeqCst) => return,
             Some(a) if slot_free => Some(a.json()),
             // Out of updates: never leave a different song up meanwhile.
-            Some(a) if self.shown.as_ref().is_some_and(|s| !s.same_content(a)) => None,
-            Some(_) => return, // same song, only the time moved: wait for a slot
+            Some(a) if self.shown.as_ref().is_some_and(|s| !s.same_song(a)) => None,
+            // The same song (only its art or time changed): wait for a slot.
+            Some(_) => return,
             None => None,
         };
         let clearing = payload.is_none();
